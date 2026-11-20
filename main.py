@@ -2,7 +2,6 @@ import asyncio
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
-from typing import Optional
 
 import httpx
 import psycopg
@@ -69,16 +68,16 @@ def ensure_table():
         conn.commit()
 
 
-# ── Agent Tools (Callable by Gemini) ─────────────────────────────────────────
+# ── Agent Tools (Callable by Gemini — no default values in signatures) ───────
 def add_task(
     title: str,
     category: str,
     schedule_type: str,
     next_run_at: str,
-    time_of_day: str = "08:00:00",
-    interval_minutes: int = 0,
-    active_start: str = "07:00:00",
-    active_end: str = "22:00:00",
+    time_of_day: str,
+    interval_minutes: int,
+    active_start: str,
+    active_end: str,
 ) -> dict:
     """Add a new task or reminder to the agent_tasks table.
 
@@ -87,10 +86,10 @@ def add_task(
         category: Category like 'prayer', 'water', 'job', or 'general'.
         schedule_type: Must be 'once', 'daily', or 'interval'.
         next_run_at: Exact next trigger ISO-8601 timestamp with +05:30 IST offset, e.g. '2026-11-21T05:15:00+05:30'.
-        time_of_day: 24-hour HH:MM:SS time for daily reminders (default '08:00:00').
-        interval_minutes: Repeat interval in minutes for 'interval' tasks, or 0 otherwise.
-        active_start: Start of active window in HH:MM:SS for interval tasks (default '07:00:00').
-        active_end: End of active window in HH:MM:SS for interval tasks (default '22:00:00').
+        time_of_day: 24-hour HH:MM:SS time for daily reminders (pass '08:00:00' if not daily).
+        interval_minutes: Repeat interval in minutes for 'interval' tasks, or 0 if not interval.
+        active_start: Start of active window in HH:MM:SS for interval tasks (pass '07:00:00' by default).
+        active_end: End of active window in HH:MM:SS for interval tasks (pass '22:00:00' by default).
     """
     with get_db_conn() as conn, conn.cursor() as cur:
         cur.execute(
@@ -105,10 +104,10 @@ def add_task(
                 title,
                 category,
                 schedule_type,
-                time_of_day,
-                interval_minutes,
-                active_start,
-                active_end,
+                time_of_day or "08:00:00",
+                interval_minutes or 0,
+                active_start or "07:00:00",
+                active_end or "22:00:00",
                 next_run_at,
             ),
         )
@@ -174,13 +173,13 @@ def run_arthur_agent(user_text: str) -> str:
         "You are Arthur, a private, concise personal daily task and reminder assistant.\n"
         f"Current IST date and time (Asia/Kolkata, UTC+05:30): {now_ist}\n\n"
         "Rules:\n"
-        "1. Adding tasks/reminders: Call add_task immediately.\n"
+        "1. Adding tasks/reminders: Call add_task immediately (always pass all 8 arguments).\n"
         "   - One-time reminder (e.g. 'Remind me in 2 minutes' or 'at 6 PM'): schedule_type='once', "
-        "compute exact next_run_at in ISO format with +05:30 offset.\n"
+        "compute exact next_run_at in ISO format with +05:30 offset, time_of_day='08:00:00', interval_minutes=0, active_start='07:00:00', active_end='22:00:00'.\n"
         "   - Daily fixed-time reminder (e.g. prayer times like 'Fajr at 5:15 AM daily'): schedule_type='daily', "
-        "category='prayer', time_of_day='05:15:00' (24h HH:MM:SS), and next_run_at set to the next upcoming IST occurrence.\n"
+        "category='prayer', time_of_day='05:15:00' (24h HH:MM:SS), interval_minutes=0, active_start='00:00:00', active_end='23:59:00', and next_run_at set to the next upcoming IST occurrence.\n"
         "   - Repeating interval reminder (e.g. 'Drink water every 60 mins from 8 AM to 10 PM'): schedule_type='interval', "
-        "category='water', interval_minutes=60, active_start='08:00:00', active_end='22:00:00', next_run_at set to now + interval.\n"
+        "category='water', time_of_day='08:00:00', interval_minutes=60, active_start='08:00:00', active_end='22:00:00', next_run_at set to now + interval.\n"
         "   - For multiple reminders in one message (e.g. 5 prayer times), call add_task once for each.\n"
         "2. Viewing tasks: Call list_tasks and show ID, title, schedule type, and next IST time.\n"
         "3. Removing tasks: Call list_tasks first if you need the ID, then call delete_task_by_id or delete_tasks_by_category.\n"
