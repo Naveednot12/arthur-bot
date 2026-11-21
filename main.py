@@ -16,7 +16,11 @@ from google.genai import types
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED_CHAT_ID = str(os.environ["ALLOWED_CHAT_ID"]).strip()
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+PRIMARY_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+FALLBACK_MODELS = [
+    m for m in dict.fromkeys([PRIMARY_MODEL, "gemini-3.6-flash", "gemini-3.5-flash-lite"])
+    if m
+]
 
 DB_HOST = os.environ["DB_POSTGRESDB_HOST"]
 DB_PORT = os.getenv("DB_POSTGRESDB_PORT", "5432")
@@ -49,7 +53,7 @@ def get_db_conn():
     )
 
 
-def ensure_table():
+def ensure_tables():
     with get_db_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -66,12 +70,63 @@ def ensure_table():
               is_active BOOLEAN DEFAULT TRUE,
               created_at TIMESTAMPTZ DEFAULT NOW()
             );
+            CREATE TABLE IF NOT EXISTS agent_memory (
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL,
+              updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
             """
         )
         conn.commit()
 
 
+def load_all_memories() -> str:
+    try:
+        with get_db_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT key, value FROM agent_memory ORDER BY key ASC;")
+            rows = cur.fetchall()
+            if not rows:
+                return "None saved yet."
+            return "\n".join(f"- {r['key']}: {r['value']}" for r in rows)
+    except Exception:
+        return "None saved yet."
+
+
 # ── Agent Tools (Callable by Gemini — no default values in signatures) ───────
+def remember_fact(key: str, value: str) -> dict:
+    """Save or update a personal preference or fact in long-term memory (e.g. city, target_role, skills, routine).
+
+    Args:
+        key: Short snake_case label like 'city', 'target_role', 'skills', or 'prayer_city'.
+        value: The preference or detail to remember permanently.
+    """
+    with get_db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO agent_memory (key, value, updated_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+            RETURNING key, value;
+            """,
+            (key.strip().lower(), value.strip()),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        return dict(row)
+
+
+def forget_fact(key: str) -> dict:
+    """Remove a saved fact or preference from long-term memory by its key."""
+    with get_db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM agent_memory WHERE LOWER(key) = LOWER(%s) RETURNING key;",
+            (key.strip(),),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        return {"deleted": bool(row), "key": key}
+
+
 def add_task(
     title: str,
     category: str,
@@ -226,6 +281,8 @@ def fetch_webpage(url: str) -> dict:
 
 
 TOOLS = [
+    remember_fact,
+    forget_fact,
     add_task,
     list_tasks,
     delete_task_by_id,
@@ -247,35 +304,48 @@ async def send_telegram(chat_id: str, text: str):
 
 def run_arthur_agent(user_text: str) -> str:
     now_ist = datetime.now(IST).isoformat(timespec="seconds")
+    memories = load_all_memories()
+
     system_prompt = (
-        "You are Arthur, a private, concise personal AI assistant.\n"
+        "You are Arthur, a sharp, warm, proactive personal AI assistant chatting over Telegram.\n"
         f"Current IST date and time (Asia/Kolkata, UTC+05:30): {now_ist}\n\n"
-        "Capabilities & Rules:\n"
-        "1. Web & Job Search:\n"
-        "   - Use web_search whenever the user asks for live info (weather, prayer timings, news, tutorials, prices).\n"
-        "   - Use search_jobs(role, location) whenever the user asks for jobs on LinkedIn or Naukri. Present the best matches cleanly with clickable URLs.\n"
-        "   - Use fetch_webpage(url) if the user shares a link or wants details from a specific listing.\n"
-        "2. Tasks, Reminders & Alarms (always pass all 8 arguments to add_task):\n"
-        "   - One-time reminder: schedule_type='once', exact next_run_at with +05:30 offset, time_of_day='08:00:00', interval_minutes=0, active_start='07:00:00', active_end='22:00:00'.\n"
-        "   - Urgent Alarm (when user says 'alarm' or 'wake me up'): schedule_type='alarm', category='alarm', exact next_run_at with +05:30 offset, time_of_day='06:00:00', interval_minutes=0, active_start='00:00:00', active_end='23:59:00'. Tell the user it will ring repeatedly until they reply 'stop'.\n"
-        "   - Daily fixed-time reminder (e.g. prayer times): schedule_type='daily', category='prayer', 24h time_of_day='HH:MM:SS', interval_minutes=0, active_start='00:00:00', active_end='23:59:00', next_run_at set to next upcoming IST occurrence.\n"
-        "   - Repeating interval reminder (e.g. water every 60 mins from 8 AM to 10 PM): schedule_type='interval', category='water', time_of_day='08:00:00', interval_minutes=60, active_start='08:00:00', active_end='22:00:00', next_run_at set to now + interval.\n"
-        "3. Viewing & Deleting: Use list_tasks, delete_task_by_id, or delete_tasks_by_category.\n"
-        "4. Security: Never ask for passwords, banking info, photos, or personal logins. Keep replies short and clear."
+        f"What you permanently remember about the user:\n{memories}\n\n"
+        "How to act:\n"
+        "- Talk naturally like a smart peer—crisp, direct, helpful, never robotic.\n"
+        "- Whenever the user shares a preference, city, target job role, skills, or routine, proactively call remember_fact so you remember it next time.\n"
+        "- Use web_search for live info (prayer timings, weather, news, tech questions), search_jobs(role, location) for LinkedIn & Naukri jobs, and fetch_webpage(url) to inspect links.\n"
+        "- Chain tools when helpful (e.g., search today's Chennai prayer timings AND call add_task for all 5 prayers in one go).\n"
+        "- When calling add_task, ALWAYS pass all 8 arguments:\n"
+        "  • One-time reminder: schedule_type='once', exact next_run_at with +05:30 offset, time_of_day='08:00:00', interval_minutes=0, active_start='07:00:00', active_end='22:00:00'.\n"
+        "  • Urgent Alarm ('alarm' / 'wake me up'): schedule_type='alarm', category='alarm', exact next_run_at with +05:30 offset, time_of_day='06:00:00', interval_minutes=0, active_start='00:00:00', active_end='23:59:00'. Remind them it repeats every minute until they reply 'stop'.\n"
+        "  • Daily fixed-time (e.g. prayer): schedule_type='daily', category='prayer', 24h time_of_day='HH:MM:SS', interval_minutes=0, active_start='00:00:00', active_end='23:59:00', next_run_at=next upcoming IST time.\n"
+        "  • Repeating interval (e.g. water every 60 mins 8 AM–10 PM): schedule_type='interval', category='water', time_of_day='08:00:00', interval_minutes=60, active_start='08:00:00', active_end='22:00:00', next_run_at=now+interval.\n"
+        "- Security: Never ask for passwords, banking info, photos, or personal logins."
     )
 
     chat_history.append(types.Content(role="user", parts=[types.Part.from_text(text=user_text)]))
     recent = chat_history[-12:]
 
-    response = genai_client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=recent,
-        config=types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            tools=TOOLS,
-            temperature=0.2,
-        ),
-    )
+    last_err = None
+    response = None
+    for model_name in FALLBACK_MODELS:
+        try:
+            response = genai_client.models.generate_content(
+                model=model_name,
+                contents=recent,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    tools=TOOLS,
+                    temperature=0.3,
+                ),
+            )
+            break
+        except Exception as exc:
+            print(f"[agent] {model_name} failed ({type(exc).__name__}): {exc}", flush=True)
+            last_err = exc
+
+    if response is None:
+        raise last_err
 
     reply = response.text or "Done!"
     chat_history.append(types.Content(role="model", parts=[types.Part.from_text(text=reply)]))
@@ -351,7 +421,7 @@ async def reminder_loop():
 # ── FastAPI App Lifecycle ────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    ensure_table()
+    ensure_tables()
     if WEBHOOK_BASE_URL:
         async with httpx.AsyncClient(timeout=15) as client:
             res = await client.post(
@@ -370,7 +440,7 @@ app = FastAPI(lifespan=lifespan)
 @app.get("/")
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok", "agent": "Arthur"}
+    return {"status": "ok", "agent": "Arthur", "models": FALLBACK_MODELS}
 
 
 @app.post("/webhook")
@@ -397,7 +467,7 @@ async def telegram_webhook(request: Request):
     if text == "/start":
         await send_telegram(
             chat_id,
-            "Hi! I'm Arthur. I can search the web, find LinkedIn & Naukri jobs, set repeating alarms, and manage your daily reminders (prayer, water, tasks).",
+            "Hi! I'm Arthur. I remember your preferences, search the web and LinkedIn/Naukri jobs, set repeating alarms, and manage your daily reminders.",
         )
         return {"ok": True}
 
