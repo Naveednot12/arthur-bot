@@ -1,11 +1,13 @@
 import asyncio
 import os
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 
 import httpx
 import psycopg
 from psycopg.rows import dict_row
+from ddgs import DDGS
 from fastapi import FastAPI, Request
 from google import genai
 from google.genai import types
@@ -31,6 +33,7 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 genai_client = genai.Client(api_key=GEMINI_API_KEY)
 chat_history: list[types.Content] = []
+active_alarms: dict[int, int] = {}  # task_id -> remaining alarm pings
 
 
 # ── Database Helpers ─────────────────────────────────────────────────────────
@@ -79,15 +82,15 @@ def add_task(
     active_start: str,
     active_end: str,
 ) -> dict:
-    """Add a new task or reminder to the agent_tasks table.
+    """Add a new task, reminder, or repeating alarm to the agent_tasks table.
 
     Args:
-        title: Short title of the reminder or task.
-        category: Category like 'prayer', 'water', 'job', or 'general'.
-        schedule_type: Must be 'once', 'daily', or 'interval'.
-        next_run_at: Exact next trigger ISO-8601 timestamp with +05:30 IST offset, e.g. '2026-11-21T05:15:00+05:30'.
+        title: Short title of the reminder, alarm, or task.
+        category: Category like 'prayer', 'water', 'alarm', 'job', or 'general'.
+        schedule_type: Must be 'once', 'daily', 'interval', or 'alarm' (alarm repeats pings every 60s until user replies stop).
+        next_run_at: Exact next trigger ISO-8601 timestamp with +05:30 IST offset, e.g. '2026-11-22T06:00:00+05:30'.
         time_of_day: 24-hour HH:MM:SS time for daily reminders (pass '08:00:00' if not daily).
-        interval_minutes: Repeat interval in minutes for 'interval' tasks, or 0 if not interval.
+        interval_minutes: Repeat interval in minutes for 'interval' tasks, or 0 otherwise.
         active_start: Start of active window in HH:MM:SS for interval tasks (pass '07:00:00' by default).
         active_end: End of active window in HH:MM:SS for interval tasks (pass '22:00:00' by default).
     """
@@ -117,7 +120,7 @@ def add_task(
 
 
 def list_tasks() -> list[dict]:
-    """List all currently active tasks and reminders with their numeric IDs and next IST trigger times."""
+    """List all currently active tasks, reminders, and alarms with their numeric IDs and next IST trigger times."""
     with get_db_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -132,7 +135,8 @@ def list_tasks() -> list[dict]:
 
 
 def delete_task_by_id(task_id: int) -> dict:
-    """Delete a single task or reminder by its numeric ID."""
+    """Delete a single task, reminder, or alarm by its numeric ID."""
+    active_alarms.pop(task_id, None)
     with get_db_conn() as conn, conn.cursor() as cur:
         cur.execute(
             "DELETE FROM agent_tasks WHERE id = %s RETURNING id, title;",
@@ -144,7 +148,7 @@ def delete_task_by_id(task_id: int) -> dict:
 
 
 def delete_tasks_by_category(category: str) -> list[dict]:
-    """Delete all tasks belonging to a category such as 'water', 'prayer', 'job', or 'general'."""
+    """Delete all tasks belonging to a category such as 'water', 'prayer', 'alarm', 'job', or 'general'."""
     with get_db_conn() as conn, conn.cursor() as cur:
         cur.execute(
             "DELETE FROM agent_tasks WHERE LOWER(category) = LOWER(%s) RETURNING id, title;",
@@ -155,7 +159,81 @@ def delete_tasks_by_category(category: str) -> list[dict]:
         return rows if rows else [{"deleted": False, "message": f"No tasks found in category '{category}'"}]
 
 
-TOOLS = [add_task, list_tasks, delete_task_by_id, delete_tasks_by_category]
+def web_search(query: str) -> list[dict]:
+    """Search the live web for current information, prayer timings, news, prices, or answers.
+
+    Args:
+        query: Search query string.
+    """
+    try:
+        results = DDGS().text(query, region="in-en", max_results=6)
+        return [
+            {
+                "title": r.get("title", ""),
+                "url": r.get("href", ""),
+                "snippet": r.get("body", ""),
+            }
+            for r in (results or [])
+        ]
+    except Exception as exc:
+        return [{"error": f"Search failed: {exc}"}]
+
+
+def search_jobs(role: str, location: str) -> dict:
+    """Search public job listings on LinkedIn and Naukri without using any personal login.
+
+    Args:
+        role: Job title or skills, e.g. 'Python Developer' or 'Data Analyst fresher'.
+        location: City or remote preference, e.g. 'Chennai', 'Bengaluru', or 'Remote India'.
+    """
+    out = {"linkedin": [], "naukri": []}
+    try:
+        ddgs = DDGS()
+        li = ddgs.text(f'site:linkedin.com/jobs/view "{role}" {location}', region="in-en", max_results=5)
+        nk = ddgs.text(f'site:naukri.com/job-listings "{role}" {location}', region="in-en", max_results=5)
+        out["linkedin"] = [
+            {"title": r.get("title", ""), "url": r.get("href", ""), "snippet": r.get("body", "")}
+            for r in (li or [])
+        ]
+        out["naukri"] = [
+            {"title": r.get("title", ""), "url": r.get("href", ""), "snippet": r.get("body", "")}
+            for r in (nk or [])
+        ]
+    except Exception as exc:
+        out["error"] = str(exc)
+    return out
+
+
+def fetch_webpage(url: str) -> dict:
+    """Read the plain text of a public https:// webpage (e.g. a job posting or article) to summarize it.
+
+    Args:
+        url: Full public https:// URL to read.
+    """
+    if not url.startswith("https://") or any(
+        bad in url.lower() for bad in ("localhost", "127.0.0.1", "0.0.0.0", "169.254.")
+    ):
+        return {"error": "Only public https:// URLs are allowed."}
+    try:
+        with httpx.Client(timeout=12, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"}) as client:
+            resp = client.get(url)
+            text = re.sub(r"<script[\s\S]*?</script>|<style[\s\S]*?</style>", " ", resp.text, flags=re.I)
+            text = re.sub(r"<[^>]+>", " ", text)
+            text = re.sub(r"\s+", " ", text).strip()
+            return {"url": str(resp.url), "content": text[:4000]}
+    except Exception as exc:
+        return {"error": f"Could not fetch page: {exc}"}
+
+
+TOOLS = [
+    add_task,
+    list_tasks,
+    delete_task_by_id,
+    delete_tasks_by_category,
+    web_search,
+    search_jobs,
+    fetch_webpage,
+]
 
 
 # ── Telegram & AI Logic ──────────────────────────────────────────────────────
@@ -163,27 +241,27 @@ async def send_telegram(chat_id: str, text: str):
     async with httpx.AsyncClient(timeout=15) as client:
         await client.post(
             f"{TELEGRAM_API}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
+            json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
         )
 
 
 def run_arthur_agent(user_text: str) -> str:
     now_ist = datetime.now(IST).isoformat(timespec="seconds")
     system_prompt = (
-        "You are Arthur, a private, concise personal daily task and reminder assistant.\n"
+        "You are Arthur, a private, concise personal AI assistant.\n"
         f"Current IST date and time (Asia/Kolkata, UTC+05:30): {now_ist}\n\n"
-        "Rules:\n"
-        "1. Adding tasks/reminders: Call add_task immediately (always pass all 8 arguments).\n"
-        "   - One-time reminder (e.g. 'Remind me in 2 minutes' or 'at 6 PM'): schedule_type='once', "
-        "compute exact next_run_at in ISO format with +05:30 offset, time_of_day='08:00:00', interval_minutes=0, active_start='07:00:00', active_end='22:00:00'.\n"
-        "   - Daily fixed-time reminder (e.g. prayer times like 'Fajr at 5:15 AM daily'): schedule_type='daily', "
-        "category='prayer', time_of_day='05:15:00' (24h HH:MM:SS), interval_minutes=0, active_start='00:00:00', active_end='23:59:00', and next_run_at set to the next upcoming IST occurrence.\n"
-        "   - Repeating interval reminder (e.g. 'Drink water every 60 mins from 8 AM to 10 PM'): schedule_type='interval', "
-        "category='water', time_of_day='08:00:00', interval_minutes=60, active_start='08:00:00', active_end='22:00:00', next_run_at set to now + interval.\n"
-        "   - For multiple reminders in one message (e.g. 5 prayer times), call add_task once for each.\n"
-        "2. Viewing tasks: Call list_tasks and show ID, title, schedule type, and next IST time.\n"
-        "3. Removing tasks: Call list_tasks first if you need the ID, then call delete_task_by_id or delete_tasks_by_category.\n"
-        "4. Never ask for passwords, banking info, photos, or personal accounts. Keep replies short and clear."
+        "Capabilities & Rules:\n"
+        "1. Web & Job Search:\n"
+        "   - Use web_search whenever the user asks for live info (weather, prayer timings, news, tutorials, prices).\n"
+        "   - Use search_jobs(role, location) whenever the user asks for jobs on LinkedIn or Naukri. Present the best matches cleanly with clickable URLs.\n"
+        "   - Use fetch_webpage(url) if the user shares a link or wants details from a specific listing.\n"
+        "2. Tasks, Reminders & Alarms (always pass all 8 arguments to add_task):\n"
+        "   - One-time reminder: schedule_type='once', exact next_run_at with +05:30 offset, time_of_day='08:00:00', interval_minutes=0, active_start='07:00:00', active_end='22:00:00'.\n"
+        "   - Urgent Alarm (when user says 'alarm' or 'wake me up'): schedule_type='alarm', category='alarm', exact next_run_at with +05:30 offset, time_of_day='06:00:00', interval_minutes=0, active_start='00:00:00', active_end='23:59:00'. Tell the user it will ring repeatedly until they reply 'stop'.\n"
+        "   - Daily fixed-time reminder (e.g. prayer times): schedule_type='daily', category='prayer', 24h time_of_day='HH:MM:SS', interval_minutes=0, active_start='00:00:00', active_end='23:59:00', next_run_at set to next upcoming IST occurrence.\n"
+        "   - Repeating interval reminder (e.g. water every 60 mins from 8 AM to 10 PM): schedule_type='interval', category='water', time_of_day='08:00:00', interval_minutes=60, active_start='08:00:00', active_end='22:00:00', next_run_at set to now + interval.\n"
+        "3. Viewing & Deleting: Use list_tasks, delete_task_by_id, or delete_tasks_by_category.\n"
+        "4. Security: Never ask for passwords, banking info, photos, or personal logins. Keep replies short and clear."
     )
 
     chat_history.append(types.Content(role="user", parts=[types.Part.from_text(text=user_text)]))
@@ -206,7 +284,7 @@ def run_arthur_agent(user_text: str) -> str:
     return reply
 
 
-# ── Background 30-Second Reminder Loop ───────────────────────────────────────
+# ── Background 30-Second Reminder & Alarm Loop ───────────────────────────────
 async def reminder_loop():
     while True:
         try:
@@ -221,26 +299,48 @@ async def reminder_loop():
                 due_tasks = cur.fetchall()
 
                 for task in due_tasks:
-                    await send_telegram(ALLOWED_CHAT_ID, f"⏰ Reminder: {task['title']}")
-                    cur.execute(
-                        """
-                        UPDATE agent_tasks
-                        SET
-                          is_active = CASE WHEN schedule_type = 'once' THEN FALSE ELSE TRUE END,
-                          next_run_at = CASE
-                            WHEN schedule_type = 'daily' THEN next_run_at + INTERVAL '1 day'
-                            WHEN schedule_type = 'interval' THEN
-                              CASE
-                                WHEN ((NOW() + (interval_minutes || ' minutes')::INTERVAL) AT TIME ZONE 'Asia/Kolkata')::TIME > active_end
-                                THEN (((NOW() AT TIME ZONE 'Asia/Kolkata')::DATE + 1) + active_start) AT TIME ZONE 'Asia/Kolkata'
-                                ELSE NOW() + (interval_minutes || ' minutes')::INTERVAL
+                    tid = task["id"]
+                    stype = task["schedule_type"]
+
+                    if stype == "alarm":
+                        remaining = active_alarms.get(tid, 5)
+                        await send_telegram(
+                            ALLOWED_CHAT_ID,
+                            f"🚨 ALARM: {task['title']}\n(Reply 'stop' to silence — {remaining} ping(s) left)",
+                        )
+                        if remaining > 1:
+                            active_alarms[tid] = remaining - 1
+                            cur.execute(
+                                "UPDATE agent_tasks SET next_run_at = NOW() + INTERVAL '1 minute' WHERE id = %s;",
+                                (tid,),
+                            )
+                        else:
+                            active_alarms.pop(tid, None)
+                            cur.execute(
+                                "UPDATE agent_tasks SET is_active = FALSE WHERE id = %s;",
+                                (tid,),
+                            )
+                    else:
+                        await send_telegram(ALLOWED_CHAT_ID, f"⏰ Reminder: {task['title']}")
+                        cur.execute(
+                            """
+                            UPDATE agent_tasks
+                            SET
+                              is_active = CASE WHEN schedule_type = 'once' THEN FALSE ELSE TRUE END,
+                              next_run_at = CASE
+                                WHEN schedule_type = 'daily' THEN next_run_at + INTERVAL '1 day'
+                                WHEN schedule_type = 'interval' THEN
+                                  CASE
+                                    WHEN ((NOW() + (interval_minutes || ' minutes')::INTERVAL) AT TIME ZONE 'Asia/Kolkata')::TIME > active_end
+                                    THEN (((NOW() AT TIME ZONE 'Asia/Kolkata')::DATE + 1) + active_start) AT TIME ZONE 'Asia/Kolkata'
+                                    ELSE NOW() + (interval_minutes || ' minutes')::INTERVAL
+                                  END
+                                ELSE next_run_at
                               END
-                            ELSE next_run_at
-                          END
-                        WHERE id = %s;
-                        """,
-                        (task["id"],),
-                    )
+                            WHERE id = %s;
+                            """,
+                            (tid,),
+                        )
                 conn.commit()
         except Exception as exc:
             print(f"[reminder_loop] error: {exc}", flush=True)
@@ -284,10 +384,20 @@ async def telegram_webhook(request: Request):
     if chat_id != ALLOWED_CHAT_ID or not text:
         return {"ok": True}
 
+    if text.lower() in ("stop", "/stop", "silence"):
+        if active_alarms:
+            ids = list(active_alarms.keys())
+            active_alarms.clear()
+            with get_db_conn() as conn, conn.cursor() as cur:
+                cur.execute("UPDATE agent_tasks SET is_active = FALSE WHERE id = ANY(%s);", (ids,))
+                conn.commit()
+            await send_telegram(chat_id, "🔕 Alarm silenced.")
+            return {"ok": True}
+
     if text == "/start":
         await send_telegram(
             chat_id,
-            "Hi! I'm Arthur. Ask me to add, list, or delete any reminder (like prayer times, hourly water reminders, or one-off tasks).",
+            "Hi! I'm Arthur. I can search the web, find LinkedIn & Naukri jobs, set repeating alarms, and manage your daily reminders (prayer, water, tasks).",
         )
         return {"ok": True}
 
